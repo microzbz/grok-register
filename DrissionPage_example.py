@@ -1,5 +1,5 @@
 from DrissionPage import Chromium, ChromiumOptions
-from DrissionPage.errors import PageDisconnectedError
+from DrissionPage.errors import ContextLostError, ElementLostError, PageDisconnectedError
 import argparse
 import shutil
 import tempfile
@@ -23,7 +23,7 @@ def setup_run_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    fmt = logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s | pid=%(process)d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -36,11 +36,15 @@ def setup_run_logger() -> logging.Logger:
 
 
 run_logger: logging.Logger = None
+browser = None
+page = None
+_chrome_temp_dir = ""
+RECOVERABLE_PAGE_ERRORS = (PageDisconnectedError, ContextLostError, ElementLostError)
 
 
 
 def ensure_stable_python_runtime():
-    # 优先自动切到更稳定的 3.12 / 3.13，避免 3.14 下 Mail.tm 偶发 TLS/兼容问题。
+    # 优先自动切到更稳定的 3.12 / 3.13，避免 3.14 下部分网络库兼容问题。
     if sys.version_info < (3, 14) or os.environ.get("DPE_REEXEC_DONE") == "1":
         return
 
@@ -64,9 +68,9 @@ def ensure_stable_python_runtime():
 
 
 def warn_runtime_compatibility():
-    # 中文提示：避免把底层 TLS 兼容问题误判成脚本逻辑错误。
+    # 中文提示：避免把底层 TLS/HTTP 兼容问题误判成脚本逻辑错误。
     if sys.version_info >= (3, 14):
-        print("[提示] 当前 Python 为 3.14+；若出现 Mail.tm TLS 异常，建议改用 Python 3.12 或 3.13。")
+        print("[提示] 当前 Python 为 3.14+；若出现邮箱接口异常，建议改用 Python 3.12 或 3.13。")
 
 
 ensure_stable_python_runtime()
@@ -83,13 +87,6 @@ if not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1":
     except Exception as e:
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
 
-co = ChromiumOptions()
-co.auto_port()
-co.set_argument("--no-sandbox")
-co.set_argument("--disable-gpu")
-co.set_argument("--disable-dev-shm-usage")
-co.set_argument("--disable-software-rasterizer")
-
 # 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
 try:
@@ -102,34 +99,69 @@ try:
 except Exception:
     pass
 if _browser_proxy:
-    co.set_proxy(_browser_proxy)
     print(f"[*] 浏览器代理: {_browser_proxy}")
 
 # Linux 服务器自动检测 chromium 路径
 import platform
 import shutil
 import glob as _glob_mod
+_detected_browser_path = ""
 if platform.system() == "Linux":
     # 优先用 playwright 装的 chromium（无 AppArmor 限制）
     _pw_chromes = _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
     if _pw_chromes:
-        co.set_browser_path(_pw_chromes[0])
+        _detected_browser_path = _pw_chromes[0]
     else:
         for _candidate in ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"]:
             if os.path.isfile(_candidate):
-                co.set_browser_path(_candidate)
+                _detected_browser_path = _candidate
                 break
     # user_data_path 在 start_browser() 每轮动态设置，此处不固定
 
-co.set_timeouts(base=1)
-
-# 加载修复 MouseEvent.screenX / screenY 的扩展。
 EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
-co.add_extension(EXTENSION_PATH)
 
-_chrome_temp_dir: str = ""
-browser = None
-page = None
+
+def _get_thread_browser():
+    return browser
+
+
+def _set_thread_browser(value):
+    global browser
+    browser = value
+
+
+def _get_thread_page():
+    return page
+
+
+def _set_thread_page(value):
+    global page
+    page = value
+
+
+def _get_thread_chrome_temp_dir() -> str:
+    return str(_chrome_temp_dir or "")
+
+
+def _set_thread_chrome_temp_dir(value: str):
+    global _chrome_temp_dir
+    _chrome_temp_dir = value
+
+
+def build_chromium_options():
+    options = ChromiumOptions()
+    options.auto_port()
+    options.set_argument("--no-sandbox")
+    options.set_argument("--disable-gpu")
+    options.set_argument("--disable-dev-shm-usage")
+    options.set_argument("--disable-software-rasterizer")
+    if _browser_proxy:
+        options.set_proxy(_browser_proxy)
+    if _detected_browser_path:
+        options.set_browser_path(_detected_browser_path)
+    options.set_timeouts(base=5)
+    options.add_extension(EXTENSION_PATH)
+    return options
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
@@ -137,42 +169,46 @@ _sso_dir = os.path.join(os.path.dirname(__file__), "sso")
 _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
-
 def start_browser():
     # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
-    global browser, page, _chrome_temp_dir
-    _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
-    co.set_user_data_path(_chrome_temp_dir)
-    browser = Chromium(co)
-    tabs = browser.get_tabs()
-    page = tabs[-1] if tabs else browser.new_tab()
-    return browser, page
+    chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
+    options = build_chromium_options()
+    options.set_user_data_path(chrome_temp_dir)
+    browser_instance = Chromium(options)
+    tabs = browser_instance.get_tabs()
+    page_instance = tabs[-1] if tabs else browser_instance.new_tab()
+    _set_thread_chrome_temp_dir(chrome_temp_dir)
+    _set_thread_browser(browser_instance)
+    _set_thread_page(page_instance)
+    return browser_instance, page_instance
 
 
 def stop_browser():
     # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
-    global browser, page, _chrome_temp_dir
-    if browser is not None:
+    browser_instance = _get_thread_browser()
+    chrome_temp_dir = _get_thread_chrome_temp_dir()
+    if browser_instance is not None:
         try:
-            browser.quit()
+            browser_instance.quit()
         except Exception:
             pass
-    browser = None
-    page = None
-    if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
-        shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
-    _chrome_temp_dir = ""
+    _set_thread_browser(None)
+    _set_thread_page(None)
+    if chrome_temp_dir and os.path.isdir(chrome_temp_dir):
+        shutil.rmtree(chrome_temp_dir, ignore_errors=True)
+    _set_thread_chrome_temp_dir("")
 
 
 def restart_browser():
     # 清除 cookie/storage 代替完整重启，节省 Chrome 冷启动时间。
-    global browser, page
-    if browser is None:
+    browser_instance = _get_thread_browser()
+    if browser_instance is None:
         start_browser()
         return
     try:
-        tabs = browser.get_tabs()
-        page = tabs[-1] if tabs else browser.new_tab()
+        tabs = browser_instance.get_tabs()
+        page_instance = tabs[-1] if tabs else browser_instance.new_tab()
+        _set_thread_page(page_instance)
         page.run_js("window.localStorage.clear(); window.sessionStorage.clear();")
         page.clear_cache(session_storage=True, cookies=True)
     except Exception:
@@ -182,30 +218,89 @@ def restart_browser():
 
 def refresh_active_page():
     # 验证码确认后页面会跳转，旧 page 句柄可能断开，这里统一重新获取当前活动标签页。
-    global browser, page
-    if browser is None:
+    browser_instance = _get_thread_browser()
+    if browser_instance is None:
         start_browser()
+        browser_instance = _get_thread_browser()
     try:
-        tabs = browser.get_tabs()
+        tabs = browser_instance.get_tabs()
         if tabs:
-            page = tabs[-1]
+            _set_thread_page(tabs[-1])
         else:
-            page = browser.new_tab()
+            _set_thread_page(browser_instance.new_tab())
     except Exception:
         restart_browser()
     return page
 
 
-def open_signup_page():
-    # 每轮开始时打开注册页，并切到“使用邮箱注册”流程。
-    global page
-    refresh_active_page()
-    try:
-        page.get(SIGNUP_URL)
-    except Exception:
+def wait_for_signup_entry(timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         refresh_active_page()
-        page = browser.new_tab(SIGNUP_URL)
-    click_email_signup_button()
+        try:
+            state = page.run_js(
+                r"""
+const readyState = document.readyState || '';
+const url = location.href || '';
+const hasEmailInput = !!document.querySelector('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]');
+const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+const hasEmailButton = candidates.some((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return text.includes('使用邮箱注册') || text.includes('signupwithemail') || text.includes('signupemail') || text.includes('continuewithemail') || text === 'email' || text.includes('email');
+});
+return {
+    readyState,
+    url,
+    ready: readyState === 'complete' || readyState === 'interactive',
+    hasEmailInput,
+    hasEmailButton,
+};
+                """
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            time.sleep(0.5)
+            continue
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        if state and state.get("ready") and (state.get("hasEmailInput") or state.get("hasEmailButton")):
+            return True
+
+        time.sleep(0.5)
+
+    return False
+
+
+def open_signup_page(max_attempts=3):
+    # 每轮开始时打开注册页，并切到“使用邮箱注册”流程。
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        refresh_active_page()
+        try:
+            page.get(SIGNUP_URL)
+        except Exception:
+            try:
+                refresh_active_page()
+                _set_thread_page(browser.new_tab(SIGNUP_URL))
+            except Exception as error:
+                last_error = error
+                time.sleep(1)
+                continue
+
+        if not wait_for_signup_entry(timeout=20):
+            last_error = Exception("注册入口页面未就绪")
+            time.sleep(1)
+            continue
+
+        try:
+            click_email_signup_button(timeout=15)
+            return
+        except Exception as error:
+            last_error = error
+            time.sleep(1)
+
+    raise last_error or Exception("打开注册页失败")
 
 
 def close_current_page():
@@ -233,7 +328,8 @@ def click_email_signup_button(timeout=10):
     # 页面打开后，自动点击“使用邮箱注册”按钮。
     deadline = time.time() + timeout
     while time.time() < deadline:
-        clicked = page.run_js(r"""
+        try:
+            clicked = page.run_js(r"""
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = candidates.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
@@ -247,6 +343,14 @@ if (!target) {
 target.click();
 return true;
         """)
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(0.5)
+            continue
+        except Exception:
+            refresh_active_page()
+            time.sleep(0.5)
+            continue
 
         if clicked:
             return True
@@ -264,8 +368,9 @@ def fill_email_and_submit(timeout=15):
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        filled = page.run_js(
-            """
+        try:
+            filled = page.run_js(
+                """
 const email = arguments[0];
 
 function isVisible(node) {
@@ -322,8 +427,16 @@ if ((input.value || '').trim() !== email || !input.checkValidity()) {
 input.blur();
 return 'filled';
             """,
-            email,
-        )
+                email,
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(0.5)
+            continue
+        except Exception:
+            refresh_active_page()
+            time.sleep(0.5)
+            continue
 
         if filled == 'not-ready':
             time.sleep(0.5)
@@ -336,8 +449,9 @@ return 'filled';
 
         if filled == 'filled':
             time.sleep(0.8)
-            clicked = page.run_js(
-                r"""
+            try:
+                clicked = page.run_js(
+                    r"""
 function isVisible(node) {
     if (!node) {
         return false;
@@ -373,7 +487,15 @@ if (!submitButton || submitButton.disabled) {
 submitButton.click();
 return true;
                 """
-            )
+                )
+            except RECOVERABLE_PAGE_ERRORS:
+                refresh_active_page()
+                time.sleep(0.5)
+                continue
+            except Exception:
+                refresh_active_page()
+                time.sleep(0.5)
+                continue
 
             if clicked:
                 print(f"[*] 已填写邮箱并点击注册: {email}")
@@ -387,7 +509,7 @@ return true;
 
 def fill_code_and_submit(email, dev_token, timeout=60):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
-    code = get_oai_code(dev_token, email)
+    code = get_oai_code(dev_token, email, timeout=max(timeout, 90))
     if not code:
         raise Exception("获取验证码失败")
 
@@ -503,7 +625,7 @@ return merged === code ? 'filled' : 'box-mismatch';
                 """,
                 code,
             )
-        except PageDisconnectedError:
+        except RECOVERABLE_PAGE_ERRORS:
             # 点击确认邮箱后如果刚好发生跳转，旧页面句柄会断开；此时切到新页继续判断即可。
             refresh_active_page()
             if has_profile_form():
@@ -592,7 +714,7 @@ confirmButton.click();
 return 'clicked';
                     """
                 )
-            except PageDisconnectedError:
+            except RECOVERABLE_PAGE_ERRORS:
                 refresh_active_page()
                 if has_profile_form():
                     print("[*] 确认邮箱后页面跳转成功，已进入最终注册页。")
@@ -661,7 +783,7 @@ def getTurnstileToken():
 
     turnstileResponse = None
 
-    for i in range(0, 15):
+    for _ in range(0, 15):
         try:
             turnstileResponse = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
             if turnstileResponse:
@@ -683,12 +805,12 @@ let screenY = getRandomInt(400, 600);
 
 Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
 Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-                        """)
+            """)
 
             challengeIframeBody = challengeIframe.ele("tag:body").shadow_root
             challengeButton = challengeIframeBody.ele("tag:input")
             challengeButton.click()
-        except:
+        except Exception:
             pass
         time.sleep(1)
     raise Exception("failed to solve turnstile")
@@ -709,8 +831,9 @@ def fill_profile_and_submit(timeout=30):
     turnstile_token = ""
 
     while time.time() < deadline:
-        filled = page.run_js(
-            """
+        try:
+            filled = page.run_js(
+                """
 const givenName = arguments[0];
 const familyName = arguments[1];
 const password = arguments[2];
@@ -793,11 +916,15 @@ return [
     String(familyInput.value || '').trim() === String(familyName || '').trim(),
     String(passwordInput.value || '') === String(password || ''),
 ].every(Boolean) ? 'filled' : 'verify-failed';
-            """,
-            given_name,
-            family_name,
-            password,
-        )
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(1)
+            continue
 
         if filled == 'not-ready':
             time.sleep(0.5)
@@ -808,8 +935,9 @@ return [
             time.sleep(0.5)
             continue
 
-        values_ok = page.run_js(
-            """
+        try:
+            values_ok = page.run_js(
+                """
 const expectedGiven = arguments[0];
 const expectedFamily = arguments[1];
 const expectedPassword = arguments[2];
@@ -843,33 +971,43 @@ if (!givenInput || !familyInput || !passwordInput) {
 return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
     && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
     && String(passwordInput.value || '') === String(expectedPassword || '');
-            """,
-            given_name,
-            family_name,
-            password,
-        )
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(1)
+            continue
         if not values_ok:
             print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
             time.sleep(0.5)
             continue
 
-        turnstile_state = page.run_js(
-            """
+        try:
+            turnstile_state = page.run_js(
+                """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!challengeInput) {
     return 'not-found';
 }
 const value = String(challengeInput.value || '').trim();
 return value ? 'ready' : 'pending';
-            """
-        )
+                """
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(1)
+            continue
 
         if turnstile_state == "pending" and not turnstile_token:
             print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
             turnstile_token = getTurnstileToken()
             if turnstile_token:
-                synced = page.run_js(
-                    """
+                try:
+                    synced = page.run_js(
+                        """
 const token = arguments[0];
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!challengeInput) {
@@ -884,9 +1022,13 @@ if (nativeSetter) {
 challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
 challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
 return String(challengeInput.value || '').trim() === String(token || '').trim();
-                    """,
-                    turnstile_token,
-                )
+                        """,
+                        turnstile_token,
+                    )
+                except RECOVERABLE_PAGE_ERRORS:
+                    refresh_active_page()
+                    time.sleep(1)
+                    continue
                 if synced:
                     print("[*] Turnstile 响应已同步到最终注册表单。")
 
@@ -898,8 +1040,9 @@ return String(challengeInput.value || '').trim() === String(token || '').trim();
             submit_button = None
 
         if not submit_button:
-            clicked = page.run_js(
-                r"""
+            try:
+                clicked = page.run_js(
+                    r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (challengeInput && !String(challengeInput.value || '').trim()) {
     return false;
@@ -916,16 +1059,30 @@ submitButton.focus();
 submitButton.click();
 return true;
                 """
-            )
+                )
+            except RECOVERABLE_PAGE_ERRORS:
+                refresh_active_page()
+                time.sleep(1)
+                continue
         else:
-            challenge_value = page.run_js(
-                """
+            try:
+                challenge_value = page.run_js(
+                    """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
                 """
-            )
+                )
+            except RECOVERABLE_PAGE_ERRORS:
+                refresh_active_page()
+                time.sleep(1)
+                continue
             if challenge_value not in ('not-found', ''):
-                submit_button.click()
+                try:
+                    submit_button.click()
+                except RECOVERABLE_PAGE_ERRORS:
+                    refresh_active_page()
+                    time.sleep(1)
+                    continue
                 clicked = True
             else:
                 clicked = False
@@ -947,8 +1104,9 @@ def extract_visible_numbers(timeout=60):
     # 登录/注册完成后，提取页面上可见的普通数字文本，不处理任何敏感 Cookie。
     deadline = time.time() + timeout
     while time.time() < deadline:
-        result = page.run_js(
-            r"""
+        try:
+            result = page.run_js(
+                r"""
 function isVisible(el) {
     if (!el) {
         return false;
@@ -992,8 +1150,12 @@ for (const node of document.querySelectorAll(selector)) {
 }
 
 return matches.slice(0, 30);
-            """
-        )
+                """
+            )
+        except RECOVERABLE_PAGE_ERRORS:
+            refresh_active_page()
+            time.sleep(1)
+            continue
 
         if result:
             print("[*] 页面可见数字文本提取结果:")
@@ -1017,7 +1179,7 @@ def wait_for_sso_cookie(timeout=30):
     while time.time() < deadline:
         try:
             refresh_active_page()
-            if page is None:
+            if _get_thread_page() is None:
                 time.sleep(1)
                 continue
 
@@ -1037,7 +1199,7 @@ def wait_for_sso_cookie(timeout=30):
                     print("[*] 注册完成后已获取到 sso cookie。")
                     return value
 
-        except PageDisconnectedError:
+        except RECOVERABLE_PAGE_ERRORS:
             refresh_active_page()
         except Exception:
             pass
@@ -1056,14 +1218,41 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "a", encoding="utf-8") as file:
         file.write(normalized + "\n")
+        file.flush()
 
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
 
 
+def normalize_sso_token(value):
+    token = str(value or "").strip()
+    if token.startswith("sso="):
+        token = token[4:]
+    return token
+
+
+def resolve_grok2api_admin_urls(endpoint: str):
+    base = str(endpoint or "").strip().rstrip("/")
+    if not base:
+        return "", "", ""
+
+    if base.endswith("/admin/api/tokens/add"):
+        admin_api = base[: -len("/tokens/add")]
+    elif base.endswith("/admin/api/tokens"):
+        admin_api = base[: -len("/tokens")]
+    elif base.endswith("/admin/api"):
+        admin_api = base
+    elif base.endswith("/admin"):
+        admin_api = f"{base}/api"
+    else:
+        admin_api = f"{base}/admin/api"
+
+    return admin_api, f"{admin_api}/tokens", f"{admin_api}/tokens/add"
+
+
 def push_sso_to_api(new_tokens: list):
     # 推送 SSO token 到 grok2api 管理接口。
-    # append=false：直接将本次 token 列表全量推送（覆盖）。
-    # append=true（默认）：先 GET 查询线上现有 token，合并本次后全量推送。
+    # append=true：调用 /admin/api/tokens/add，服务端自动去重。
+    # append=false：调用 /admin/api/tokens 覆盖指定 pool。
     import json
     import urllib3
     import requests
@@ -1080,9 +1269,14 @@ def push_sso_to_api(new_tokens: list):
     api_conf = conf.get("api", {})
     endpoint = str(api_conf.get("endpoint", "")).strip()
     api_token = str(api_conf.get("token", "")).strip()
+    api_pool = str(api_conf.get("pool", "auto") or "auto").strip().lower()
     append_mode = api_conf.get("append", True)
 
     if not endpoint or not api_token:
+        return
+
+    admin_api, replace_url, add_url = resolve_grok2api_admin_urls(endpoint)
+    if not admin_api:
         return
 
     headers = {
@@ -1090,49 +1284,49 @@ def push_sso_to_api(new_tokens: list):
         "Content-Type": "application/json",
     }
 
-    tokens_to_push = [t for t in new_tokens if t]
+    tokens_to_push = []
+    seen = set()
+    for item in new_tokens:
+        token = normalize_sso_token(item)
+        if token and token not in seen:
+            seen.add(token)
+            tokens_to_push.append(token)
 
-    if append_mode:
-        try:
-            get_resp = requests.get(endpoint, headers=headers, timeout=15, verify=False)
-            if get_resp.status_code == 200:
-                data = get_resp.json()
-                # 兼容两种响应格式：
-                # 新版: {"tokens": {"ssoBasic": [...]}}
-                # 旧版: {"ssoBasic": [...]}
-                if isinstance(data, dict) and isinstance(data.get("tokens"), dict):
-                    existing = data["tokens"].get("ssoBasic", [])
-                else:
-                    existing = data.get("ssoBasic", []) if isinstance(data, dict) else []
-                existing_tokens = [
-                    item["token"] if isinstance(item, dict) else str(item)
-                    for item in existing if item
-                ]
-                seen = set()
-                deduped = []
-                for t in existing_tokens + tokens_to_push:
-                    if t not in seen:
-                        seen.add(t)
-                        deduped.append(t)
-                tokens_to_push = deduped
-                print(f"[*] 查询到线上 {len(existing_tokens)} 个 token，合并本次 {len(new_tokens)} 个，共 {len(deduped)} 个")
-            else:
-                print(f"[Error] 查询线上 token 失败: HTTP {get_resp.status_code}，放弃推送以保护存量数据")
-                return
-        except Exception as e:
-            print(f"[Error] 查询线上 token 异常: {e}，放弃推送以保护存量数据")
-            return
+    if not tokens_to_push:
+        return
 
     try:
-        resp = requests.post(
-            endpoint,
-            json={"ssoBasic": tokens_to_push},
-            headers=headers,
-            timeout=60,
-            verify=False,
-        )
+        if append_mode:
+            resp = requests.post(
+                add_url,
+                json={"pool": api_pool or "auto", "tokens": tokens_to_push},
+                headers=headers,
+                timeout=60,
+                verify=False,
+            )
+        else:
+            replace_pool = api_pool if api_pool in {"basic", "super", "heavy"} else "basic"
+            if replace_pool != api_pool:
+                print(f"[Warn] append=false 仅支持 basic/super/heavy，当前 pool={api_pool}，已改为 basic")
+            resp = requests.post(
+                replace_url,
+                json={replace_pool: tokens_to_push},
+                headers=headers,
+                timeout=60,
+                verify=False,
+            )
+
         if resp.status_code == 200:
-            print(f"[*] SSO token 已推送到 API（共 {len(tokens_to_push)} 个）: {endpoint}")
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if append_mode:
+                added = int(data.get("count", len(tokens_to_push)) or 0)
+                skipped = int(data.get("skipped", 0) or 0)
+                print(f"[*] SSO token 已推送到 grok2api（新增 {added}，跳过 {skipped}）: {add_url}")
+            else:
+                print(f"[*] SSO token 已覆盖写入 grok2api {replace_pool} 号池（共 {len(tokens_to_push)} 个）: {replace_url}")
         else:
             print(f"[Warn] 推送 API 返回异常: HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
@@ -1142,7 +1336,7 @@ def push_sso_to_api(new_tokens: list):
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # 单轮流程：打开注册页 -> 完成注册 -> 获取 sso -> 写 txt。
     open_signup_page()
-    email, dev_token = fill_email_and_submit()
+    email, dev_token = fill_email_and_submit(timeout=25)
     fill_code_and_submit(email, dev_token)
     profile = fill_profile_and_submit()
     sso_value = wait_for_sso_cookie()
@@ -1171,22 +1365,58 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
 
 
 def load_run_count() -> int:
-    # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
+    # 从 config.json 读取默认执行轮数。
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
         import json
         with open(config_path, "r", encoding="utf-8") as f:
             conf = json.load(f)
-        v = conf.get("run", {}).get("count")
-        if isinstance(v, int) and v >= 0:
-            return v
+        run_conf = conf.get("run", {}) if isinstance(conf, dict) else {}
+        count = run_conf.get("count")
+        if not isinstance(count, int) or count < 0:
+            count = 10
+        return count
     except Exception:
-        pass
-    return 10
+        return 10
+
+
+def run_registration_loop(total_count: int, output_path: str, extract_numbers: bool) -> list[str]:
+    collected = []
+    current_round = 0
+    try:
+        while True:
+            if total_count > 0 and current_round >= total_count:
+                break
+            current_round += 1
+            if _get_thread_browser() is None:
+                start_browser()
+
+            print(f"\n[*] 开始第 {current_round} 轮注册")
+            if run_logger:
+                run_logger.info("开始第 %s 轮注册", current_round)
+
+            try:
+                result = run_single_registration(output_path, extract_numbers=extract_numbers)
+                collected.append(result["sso"])
+            except KeyboardInterrupt:
+                print("\n[Info] 收到中断信号，停止后续轮次。")
+                break
+            except Exception as error:
+                print(f"[Error] 第 {current_round} 轮失败: {error}")
+                if run_logger:
+                    run_logger.exception("第 %s 轮失败: %s", current_round, error)
+            finally:
+                stop_browser()
+
+            if total_count == 0 or current_round < total_count:
+                time.sleep(2)
+    finally:
+        stop_browser()
+    return collected
 
 
 def main():
-    # 默认循环执行；每轮完成后关闭当前页，再自动进入下一轮。
+    # 默认循环执行；单进程顺序注册。
     global run_logger
     run_logger = setup_run_logger()
 
@@ -1198,39 +1428,15 @@ def main():
     parser.add_argument("--extract-numbers", action="store_true", help="注册完成后额外提取页面数字文本")
     args = parser.parse_args()
 
-    current_round = 0
-    collected_sso: list = []
+    collected_sso: list[str] = []
     try:
-        start_browser()
-        while True:
-            if args.count > 0 and current_round >= args.count:
-                break
-
-            current_round += 1
-            print(f"\n[*] 开始第 {current_round} 轮注册")
-            round_succeeded = False
-
-            try:
-                result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
-                collected_sso.append(result["sso"])
-                round_succeeded = True
-            except KeyboardInterrupt:
-                print("\n[Info] 收到中断信号，停止后续轮次。")
-                break
-            except Exception as error:
-                print(f"[Error] 第 {current_round} 轮失败: {error}")
-            finally:
-                restart_browser()
-
-            if args.count == 0 or current_round < args.count:
-                time.sleep(2)
-
+        collected_sso = run_registration_loop(args.count, args.output, args.extract_numbers)
+    except KeyboardInterrupt:
+        print("\n[Info] 收到中断信号，正在停止注册。")
     finally:
         if collected_sso:
             print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到 API...")
             push_sso_to_api(collected_sso)
-
-        stop_browser()
 
 
 if __name__ == "__main__":

@@ -2,13 +2,15 @@
     "run": {
         "count": 10
     },
-    "duckmail_api_base": "https://api.duckmail.sbs",
-    "duckmail_bearer": "<your_duckmail_bearer_token>",
+    "cloudflare_mail_api_base": "https://your-worker.example.com",
+    "cloudflare_mail_admin_password": "",
+    "cloudflare_mail_domain": "transsionclaw.com",
     "proxy": "",
     "browser_proxy": "",
     "api": {
         "endpoint": "",
         "token": "",
+        "pool": "auto",
         "append": true
     }
 }

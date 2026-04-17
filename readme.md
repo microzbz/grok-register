@@ -1,12 +1,12 @@
 # Grok 账号批量注册工具
 
-基于 [DrissionPage](https://github.com/g1879/DrissionPage) 的 Grok (x.ai) 账号自动注册脚本，使用 [DuckMail](https://duckmail.sbs) 临时邮箱接收验证码，通过 Chrome 扩展修复 CDP `MouseEvent.screenX/screenY` 缺陷绕过 Cloudflare Turnstile。
+基于 [DrissionPage](https://github.com/g1879/DrissionPage) 的 Grok (x.ai) 账号自动注册脚本，使用 Cloudflare Worker 临时邮箱接收验证码，通过 Chrome 扩展修复 CDP `MouseEvent.screenX/screenY` 缺陷绕过 Cloudflare Turnstile。
 
 注册完成后自动推送 SSO token 到 [grok2api](https://github.com/chenyme/grok2api) 号池。
 
 ## 特性
 
-- DuckMail 临时邮箱（`curl_cffi` TLS 指纹伪装）
+- Cloudflare Worker 临时邮箱（支持自有域名）
 - Cloudflare Turnstile 自动绕过（Chrome 扩展 patch `MouseEvent.screenX/screenY`）
 - 无头服务器支持（Xvfb 虚拟显示器，自动检测 Linux 环境）
 - 中英文界面自动适配
@@ -18,7 +18,8 @@
 
 - Python 3.10+
 - Chromium 或 Chrome 浏览器
-- [DuckMail](https://duckmail.sbs) 账号（用于创建临时邮箱）
+- 已部署可收件的 Cloudflare Worker 邮箱服务
+- Worker 对应的邮箱域名、接口地址和管理密码
 - 可选：[grok2api](https://github.com/chenyme/grok2api) 实例（用于自动导入 SSO token）
 
 ---
@@ -51,8 +52,9 @@ cp config.example.json config.json
 ```json
 {
     "run": { "count": 10 },
-    "duckmail_api_base": "https://api.duckmail.sbs",
-    "duckmail_bearer": "<your_duckmail_bearer_token>",
+    "cloudflare_mail_api_base": "https://your-worker.example.com",
+    "cloudflare_mail_admin_password": "",
+    "cloudflare_mail_domain": "transsionclaw.com",
     "proxy": "",
     "browser_proxy": "",
     "api": {
@@ -68,23 +70,23 @@ cp config.example.json config.json
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `run.count` | int | 注册轮数，`0` 为无限循环，可通过 `--count` 覆盖 |
-| `duckmail_api_base` | string | DuckMail API 地址，默认 `https://api.duckmail.sbs` |
-| `duckmail_bearer` | string | DuckMail Bearer Token（[获取方式](#获取-duckmail-bearer-token)） |
-| `proxy` | string | DuckMail API 请求代理（可选） |
+| `cloudflare_mail_api_base` | string | Cloudflare Worker 地址，例如 `https://mail.example.com` |
+| `cloudflare_mail_admin_password` | string | Worker `x-admin-auth` 对应的管理密码 |
+| `cloudflare_mail_domain` | string | Worker 配置的收件域名，例如 `transsionclaw.com` |
+| `proxy` | string | Worker API 请求代理（可选） |
 | `browser_proxy` | string | 浏览器代理，无头服务器需翻墙时填写（可选） |
-| `api.endpoint` | string | grok2api 管理接口地址，留空跳过推送 |
+| `api.endpoint` | string | grok2api 地址，支持填 `http://127.0.0.1:8000` 或完整 `/admin/api/tokens/add` 地址，留空跳过推送 |
 | `api.token` | string | grok2api 的 `app_key` |
-| `api.append` | bool | `true` 合并线上已有 token，`false` 覆盖 |
+| `api.pool` | string | 导入号池，推荐 `auto`，也可填 `basic` / `super` / `heavy` |
+| `api.append` | bool | `true` 走 `/admin/api/tokens/add` 追加导入，`false` 覆盖指定 pool |
 
 ---
 
-## 获取 DuckMail Bearer Token
+## Cloudflare Worker 邮箱说明
 
-1. 打开 [duckmail.sbs](https://duckmail.sbs) 并注册登录
-2. 打开浏览器开发者工具 (F12) → Network
-3. 刷新页面，找到任意发往 `api.duckmail.sbs` 的请求
-4. 复制请求头中 `Authorization: Bearer <token>` 里的 token
-5. 填入 `config.json` 的 `duckmail_bearer` 字段
+- 当前脚本会先调用 Worker 的 `/admin/new_address` 创建邮箱，再使用返回的 `jwt` 访问 `/api/mails`
+- 你提供的 Worker 需要开放这两个接口，并且 `cloudflare_mail_domain` 必须和 Worker 内的 `EMAIL_DOMAIN` 一致
+- `cloudflare_mail_admin_password` 必须和 Worker 环境变量 `ADMIN_PASSWORD` 一致
 
 ---
 
@@ -122,7 +124,7 @@ logs/
 
 ```
 ├── DrissionPage_example.py     # 主脚本
-├── email_register.py           # DuckMail 临时邮箱封装
+├── email_register.py           # Cloudflare Worker 临时邮箱封装
 ├── config.json                 # 配置文件（不入库）
 ├── config.example.json         # 配置模板
 ├── requirements.txt            # Python 依赖
@@ -147,4 +149,4 @@ logs/
 
 - [kevinr229/grok-maintainer](https://github.com/kevinr229/grok-maintainer) — 原始项目
 - [grok2api](https://github.com/chenyme/grok2api) — Grok API 代理
-- [DuckMail](https://duckmail.sbs) — 临时邮箱服务
+- Cloudflare Email Worker — 临时邮箱服务
